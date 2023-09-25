@@ -623,8 +623,10 @@ def export(
             _AddRuntimeAssertionsForInlineConstraintsPass(range_constraints, equality_constraints)
         )
     exported_program = lift_constant_tensor_pass(exported_program)
+    exported_program = exported_program._transform(_ReplaceSymSizeOpPass())
 
-    return exported_program._transform(_ReplaceSymSizeOpPass())
+    exported_program._torch_ir = gm_torch_level
+    return exported_program
 
 
 def _reorder_kwargs_by_names(arg_names: List[str], args: Tuple[Any], kwargs: Dict[str, Any]):
@@ -739,27 +741,28 @@ def aot_compile(
         combine_args_kwargs(args, kwargs), ep.call_spec.in_spec  # type: ignore[arg-type]
     )
 
-    unlifted_module = ep.module()
-    unlifted_module.graph.set_codegen(torch.fx.CodeGen())  # type: ignore[attr-defined]
-    unlifted_module.recompile()
+    assert hasattr(ep, "_torch_ir")
+    gm = ep._torch_ir
+    gm.graph.set_codegen(torch.fx.CodeGen())  # type: ignore[attr-defined]
     options = (
-        {"from_export": True}
+        {"freezing": True}
         if options is None
-        else {**options, "from_export": True}
+        else {**options, "freezing": True}
     )
-    so_path = torch._inductor.aot_compile(unlifted_module, flat_example_inputs, options)  # type: ignore[arg-type]
+    with torch.no_grad():
+        so_path = torch._inductor.aot_compile(gm, flat_example_inputs, options)  # type: ignore[arg-type]
 
     user_inputs = []
     user_outputs = []
-    for node in unlifted_module.graph.nodes:
+    for node in gm.graph.nodes:
         if node.op == "placeholder":
             user_inputs.append(node.name)
         elif node.op == "output":
             user_outputs = [arg.name for arg in node.args[0]]
 
     unlifted_ep = ExportedProgram(
-        unlifted_module,
-        unlifted_module.graph,
+        gm,
+        gm.graph,
         ExportGraphSignature(
             parameters=[],
             buffers=[],
